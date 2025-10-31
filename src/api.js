@@ -2,13 +2,11 @@
  * src/api.js
  *
  * Full file — JSON API for the static frontend.
- * - Keeps authentication, uploads, moderation, settings, search, and document endpoints.
- * - Updated search endpoint: returns documents that are:
- *     - approved, OR
- *     - uploaded by the current signed-in user, OR
- *     - if the current user is admin, include all documents.
+ * This version includes a more robust binary streaming for /docs/:id/view and /docs/:id/download:
+ * - Ensures Content-Type and Content-Length are set.
+ * - Sends Buffer so browsers can consume the PDF reliably.
  *
- * This makes search show a user's own uploads even while pending, while keeping public results limited to approved items.
+ * It also includes the search fix (shows approved docs, user's own docs, admin sees all).
  */
 
 const express = require('express');
@@ -22,7 +20,7 @@ const { uploadPdf, fetchBlobBySha, moveToBannedFolder } = require('./githubStora
 const { markDataDirty } = require('./gitDataSync');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } }); // 150MB
 
 // Helpers
 function me(req) {
@@ -170,7 +168,7 @@ router.get('/leaderboard', (req, res) => {
 });
 
 // SEARCH / LIST docs
-// Updated: returns docs that are either approved OR belong to the current user OR (if admin) all docs.
+// Returns documents that are either approved OR belong to the current user OR (if admin) all docs.
 // Supports q (title LIKE) and school filters; those filters apply on top of visibility rules.
 router.get('/docs/search', async (req, res) => {
   try {
@@ -186,11 +184,6 @@ router.get('/docs/search', async (req, res) => {
     const isAdmin = currentUser && currentUser.is_admin;
 
     // Build SQL dynamically to incorporate visibility rules safely
-    // We select documents where:
-    // - (d.status = 'approved') OR (d.uploaded_by = :userId) OR (isAdmin -> include all)
-    // Then apply the optional title/school filters.
-
-    // Note: If user is admin, we don't restrict by status or owner.
     let sql = `
 SELECT d.id, d.title, d.course, d.school, d.grade_level, d.tags, d.created_at, d.status,
        u.status as uploader_status
@@ -209,7 +202,7 @@ WHERE 1=1
         params.userId = userId;
       }
       sql += `)`;
-    } // if admin -> no additional visibility filter
+    }
 
     // Title filter
     if (qLike) {
@@ -348,6 +341,7 @@ router.get('/docs/:id', (req, res) => {
 });
 
 // View/download binary
+// IMPORTANT: send Buffer with Content-Length header for reliable browser rendering
 router.get('/docs/:id/view', ensureAuthed, async (req, res) => {
   const doc = getDoc.get(req.params.id);
   if (!doc) return res.status(404).send('Not found');
@@ -359,12 +353,25 @@ router.get('/docs/:id/view', ensureAuthed, async (req, res) => {
     return res.status(403).send('Pending review');
   }
 
-  res.setHeader('Content-Type', 'application/pdf');
   try {
     const buf = await fetchBlobBySha(doc.github_sha);
-    res.send(buf);
+    if (!Buffer.isBuffer(buf)) {
+      // Ensure we have a Buffer
+      const b = Buffer.from(buf || '');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Length', String(b.length));
+      return res.send(b);
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', String(buf.length));
+    // Prevent caching of PDFs (optional)
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    return res.send(buf);
   } catch (e) {
-    res.status(500).send('Error fetching PDF');
+    console.error('Error fetching PDF blob', e);
+    return res.status(500).send('Error fetching PDF');
   }
 });
 
@@ -380,13 +387,16 @@ router.get('/docs/:id/download', ensureAuthed, async (req, res) => {
   }
 
   const filename = doc.title.replace(/[^a-zA-Z0-9._-]+/g, '-') + '.pdf';
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   try {
     const buf = await fetchBlobBySha(doc.github_sha);
-    res.send(buf);
+    const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || '');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', String(b.length));
+    return res.send(b);
   } catch (e) {
-    res.status(500).send('Error fetching PDF');
+    console.error('Error fetching PDF for download', e);
+    return res.status(500).send('Error fetching PDF');
   }
 });
 
