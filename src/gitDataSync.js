@@ -1,39 +1,42 @@
 /**
  * src/gitDataSync.js
  *
- * Safe data sync logic.
+ * Safe data sync that:
+ * - On initDataSync() tries a public raw download of the remote DB first (fast, no token).
+ * - If the raw download succeeds, it writes local ./data/app.db and DOES NOT push.
+ * - If raw download not available (private repo / network), falls back to GitHub API behavior.
+ * - Will NOT push a blank local DB to remote.
  *
- * Behavior:
- * - On initDataSync():
- *   1) ALWAYS check the remote repo for data/app.db first.
- *   2) If remote file exists -> PULL it and WRITE local ./data/app.db (do NOT overwrite remote).
- *   3) If remote file DOES NOT exist:
- *        - If local DB exists AND is non-empty -> CREATE remote from local (one-time).
- *        - If no local DB or local is empty -> create an empty local DB and DO NOT push (avoid overwriting remote later).
- *
- * - markDataDirty(): schedule a background sync (debounced).
- * - syncNow(force): push local DB to remote (safe: fetch sha when needed, retry with sha on 422, fallback to blob+commit for large files).
- *
- * Safety rules implemented so a fresh server WITHOUT ./data will NOT push a blank DB and overwrite a remote copy.
- *
- * IMPORTANT:
- * - Replace the existing src/gitDataSync.js with this file.
- * - To recover lost local DB from remote immediately, use the manual curl command below (I also repeat it in comments).
+ * This file is a drop-in replacement for the previous gitDataSync implementation.
  */
-
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const { octokit, GH_OWNER, GH_REPO, GH_BRANCH, configError } = require('./githubClient');
 
 const LOCAL_DB_PATH = process.env.DATABASE_URL || './data/app.db';
 const REMOTE_DB_PATH = 'data/app.db';
+const REMOTE_RAW_URL = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/${REMOTE_DB_PATH}`;
 
 let lastKnownSha = null;
 let dirty = false;
 let timer = null;
-
 const DEBOUNCE_MS = 3000;
-const SIZE_WARN_LIMIT = 90 * 1024 * 1024; // 90 MB
+const SIZE_WARN_LIMIT = 90 * 1024 * 1024; // 90MB
+
+function downloadRawUrlToBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const buffers = [];
+    https.get(url, (res) => {
+      if (res.statusCode >= 400) {
+        // Not found or not accessible
+        return reject(Object.assign(new Error(`Raw fetch failed: ${res.statusCode}`), { status: res.statusCode }));
+      }
+      res.on('data', (chunk) => buffers.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(buffers)));
+    }).on('error', (err) => reject(err));
+  });
+}
 
 async function getRemoteSha() {
   try {
@@ -51,22 +54,20 @@ async function getRemoteSha() {
   }
 }
 
-async function fetchRemoteDbBuffer() {
+async function fetchRemoteDbBufferViaApi() {
   const sha = await getRemoteSha();
   if (!sha) return null;
-
   const resp = await octokit.request('GET /repos/{owner}/{repo}/git/blobs/{file_sha}', {
     owner: GH_OWNER,
     repo: GH_REPO,
     file_sha: sha,
     headers: { accept: 'application/vnd.github.raw' }
   });
-
   const body = resp.data;
   if (Buffer.isBuffer(body)) return { buf: body, sha };
   if (typeof body === 'string') return { buf: Buffer.from(body, 'binary'), sha };
   if (body && body.content && body.encoding === 'base64') return { buf: Buffer.from(body.content, 'base64'), sha };
-  throw new Error('Unable to fetch DB blob content');
+  throw new Error('Unable to fetch DB blob content via API');
 }
 
 async function putFileContents(contentBase64, message, sha = null) {
@@ -79,12 +80,10 @@ async function putFileContents(contentBase64, message, sha = null) {
     branch: GH_BRANCH
   };
   if (sha) params.sha = sha;
-
   try {
     const { data } = await octokit.repos.createOrUpdateFileContents(params);
     return data;
   } catch (e) {
-    // Retry if GitHub complains about missing sha
     if (e.status === 422 && e.message && e.message.includes(`"sha" wasn't supplied`)) {
       const remoteSha = await getRemoteSha();
       if (remoteSha) {
@@ -143,71 +142,89 @@ async function commitRawBlob(buffer, message) {
 }
 
 /**
- * initDataSync()
- *
- * Startup logic:
- *  - If remote exists -> pull and write local (always).
- *  - Else:
- *     - If local exists and is non-empty -> create remote from local.
- *     - If local missing or empty -> create empty local file and DO NOT push.
+ * initDataSync
+ * - First: try to download the public raw URL (fast, no token). If it succeeds, use it and return.
+ * - If public raw fails (404 or other), fall back to GitHub API approach (fetch remote via API).
+ * - If remote missing:
+ *     - If local exists and non-empty -> create remote from local (one-time).
+ *     - If local missing or empty -> create empty local and DO NOT push.
  */
 async function initDataSync() {
   const localDir = path.dirname(LOCAL_DB_PATH);
   if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
 
-  // Try to fetch remote
+  // 1) Try public raw download first (works for public repos)
+  try {
+    const buf = await downloadRawUrlToBuffer(REMOTE_RAW_URL);
+    if (buf && buf.length > 0) {
+      fs.writeFileSync(LOCAL_DB_PATH, buf);
+      lastKnownSha = await getRemoteSha().catch(() => null);
+      console.log('Pulled data/app.db via public raw URL.');
+      // set up periodic flush and exit
+      setupPeriodicAndShutdown();
+      return;
+    }
+  } catch (e) {
+    // raw fetch failed (private repo or network); fall through to API
+    console.log('Public raw fetch failed, falling back to GitHub API: ', e.message || e);
+  }
+
+  // 2) Use GitHub API flow
   let remote = null;
   try {
-    remote = await fetchRemoteDbBuffer();
+    remote = await fetchRemoteDbBufferViaApi();
   } catch (e) {
     if (e.status && e.status !== 404) throw e;
   }
 
   if (remote && remote.buf) {
-    // Remote exists — pull and overwrite local
     fs.writeFileSync(LOCAL_DB_PATH, remote.buf);
     lastKnownSha = remote.sha;
-    console.log('Pulled data/app.db from remote (sha=%s).', lastKnownSha);
-  } else {
-    // Remote missing
-    if (fs.existsSync(LOCAL_DB_PATH) && fs.statSync(LOCAL_DB_PATH).size > 0) {
-      // Local non-empty -> create remote from local (one-time)
-      const buf = fs.readFileSync(LOCAL_DB_PATH);
-      const size = buf.length;
-      try {
-        if (size <= SIZE_WARN_LIMIT) {
-          const data = await putFileContents(buf.toString('base64'), 'Initialize data/app.db from local');
-          lastKnownSha = data.content.sha || null;
-          console.log('Created remote data/app.db from local (sha=%s).', lastKnownSha);
-        } else {
-          const { commitSha } = await commitRawBlob(buf, 'Initialize data/app.db from local (large file)');
-          lastKnownSha = await getRemoteSha();
-          console.log('Created remote data/app.db via raw commit (commit=%s).', commitSha);
-        }
-      } catch (e) {
-        if (e.status === 404) {
-          throw configError('Failed to create remote data/app.db: repository/branch not found or token lacking permission.');
-        }
-        throw e;
-      }
-    } else {
-      // No remote and no useful local DB -> create empty local DB and do NOT push
-      if (!fs.existsSync(LOCAL_DB_PATH)) {
-        fs.writeFileSync(LOCAL_DB_PATH, Buffer.alloc(0));
-        console.log('Created empty local data/app.db (remote not present). Not pushing blank DB.');
-      } else {
-        console.log('Remote missing and local DB empty; not creating remote to avoid overwriting repo.');
-      }
-      lastKnownSha = null;
-    }
+    console.log('Pulled data/app.db via GitHub API (sha=%s).', lastKnownSha);
+    setupPeriodicAndShutdown();
+    return;
   }
 
-  // Periodic flush (every minute) if dirty
+  // remote missing
+  if (fs.existsSync(LOCAL_DB_PATH) && fs.statSync(LOCAL_DB_PATH).size > 0) {
+    // local non-empty -> create remote from local
+    const buf = fs.readFileSync(LOCAL_DB_PATH);
+    const size = buf.length;
+    try {
+      if (size <= SIZE_WARN_LIMIT) {
+        const data = await putFileContents(buf.toString('base64'), 'Initialize data/app.db from local');
+        lastKnownSha = data.content.sha || null;
+        console.log('Created remote data/app.db from local (sha=%s).', lastKnownSha);
+      } else {
+        const { commitSha } = await commitRawBlob(buf, 'Initialize data/app.db from local (large file)');
+        lastKnownSha = await getRemoteSha();
+        console.log('Created remote data/app.db via raw commit (commit=%s).', commitSha);
+      }
+    } catch (e) {
+      if (e.status === 404) {
+        throw configError('Failed to create remote data/app.db: repository/branch not found or token lacking permission.');
+      }
+      throw e;
+    }
+  } else {
+    // No remote and local empty -> create empty local and DO NOT push
+    if (!fs.existsSync(LOCAL_DB_PATH)) {
+      fs.writeFileSync(LOCAL_DB_PATH, Buffer.alloc(0));
+      console.log('Created empty local data/app.db (remote not present). Not pushing blank DB.');
+    } else {
+      console.log('Remote missing and local DB empty; not creating remote to avoid overwriting repo.');
+    }
+    lastKnownSha = null;
+  }
+
+  setupPeriodicAndShutdown();
+}
+
+function setupPeriodicAndShutdown() {
   setInterval(() => {
     if (dirty) syncNow().catch(err => console.error('Periodic sync error:', err.message));
   }, 60 * 1000).unref();
 
-  // Final flush on shutdown
   const shutdown = async () => {
     if (dirty) {
       try { await syncNow(true); } catch (e) { console.error('Final sync error:', e.message); }
@@ -229,9 +246,7 @@ function markDataDirty() {
 
 /**
  * syncNow(force)
- *
- * Push local DB to remote safely. If remote exists, update with sha; if not, create it (but only if local non-empty).
- * Includes blob+commit fallback for large files.
+ * Push local DB to remote safely. Uses contents API (with sha) and blob+commit fallback.
  */
 async function syncNow(force = false) {
   if (!dirty && !force) return;
@@ -247,7 +262,7 @@ async function syncNow(force = false) {
   const remoteSha = await getRemoteSha();
 
   if (remoteSha) {
-    // Remote exists: update it
+    // update remote
     const contentBase64 = buf.toString('base64');
     try {
       const data = await putFileContents(contentBase64, baseMessage, remoteSha);
@@ -256,21 +271,22 @@ async function syncNow(force = false) {
       console.log('Updated remote data/app.db (sha=%s).', lastKnownSha);
       return;
     } catch (e) {
-      // If contents API failed, attempt blob+commit fallback
-      console.warn('Contents API update failed, attempting blob+commit fallback:', e.message || e);
-      try {
-        const { commitSha } = await commitRawBlob(buf, baseMessage);
-        lastKnownSha = await getRemoteSha();
-        dirty = false;
-        console.log('Updated remote data/app.db via blob commit (commit=%s).', commitSha);
-        return;
-      } catch (e2) {
-        console.error('Blob commit fallback failed:', e2.message || e2);
-        throw e2;
-      }
+      console.warn('Contents API update failed, trying blob+commit fallback:', e.message || e);
+    }
+
+    // fallback
+    try {
+      const { commitSha } = await commitRawBlob(buf, baseMessage);
+      lastKnownSha = await getRemoteSha();
+      dirty = false;
+      console.log('Updated remote data/app.db via blob commit (commit=%s).', commitSha);
+      return;
+    } catch (e2) {
+      console.error('Blob commit fallback failed:', e2.message || e2);
+      throw e2;
     }
   } else {
-    // Remote missing: create it only if local non-empty
+    // remote missing: only create if local non-empty
     if (size === 0) {
       console.warn('Local DB is empty and remote missing; refusing to push blank DB.');
       dirty = false;
@@ -306,16 +322,9 @@ module.exports = {
 };
 
 /*
-Manual recovery command (run on your server in the project root) to restore local DB from GitHub immediately:
+Manual recovery (if you prefer a single command using the public raw URL):
 
-export GITHUB_TOKEN="YOUR_TOKEN"
-curl -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
-  "https://api.github.com/repos/<OWNER>/<REPO>/contents/data/app.db?ref=<BRANCH>" -o ./data/app.db
-
-Replace <OWNER>, <REPO>, <BRANCH>, and YOUR_TOKEN.
-After that restart the app (npm start) so it will use the restored local DB.
-
-Notes:
-- With this file in place, future restarts will pull the remote copy when present and will not overwrite it with a blank local DB.
-- After restoring the local DB, the app will operate normally and subsequent DB writes will be pushed to remote safely.
+mkdir -p data
+curl -L -o ./data/app.db "https://raw.githubusercontent.com/Timmmy307/stu-private/main/data/app.db"
+ls -lh data/app.db
 */
